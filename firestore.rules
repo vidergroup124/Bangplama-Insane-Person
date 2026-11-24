@@ -1,0 +1,413 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model — Bangplama Police Station Mental Health Registry
+// ===============================================================
+//
+// Authentication Model (Firebase Auth Email/Password, auto-provisioned internal accounts):
+//   - Admin account: bangplama001@bangplama.local (no email_verified required)
+//   - Police officer account: p_<9-10 digit phone>@bangplama.local (no email_verified required)
+//   - Active officer status is verified against admin-managed `officers/{phone}.active == true`.
+//
+// Collection: officers/{phone}
+// Document ID: 9-10 digit Thai phone number matching ^[0-9]{9,10}$
+// Fields:
+//   - seq: int (optional, 0..100000) - roster sequence number
+//   - phone: string (required, must equal doc ID, ^[0-9]{9,10}$) - normalized phone
+//   - phoneDisplay: string (optional, <= 30 chars) - formatted display phone
+//   - fullName: string (required, 1..200 chars) - rank and full name
+//   - position: string (optional, <= 200 chars) - station position
+//   - callsign: string (optional, <= 100 chars) - radio callsign
+//   - category: string (optional, <= 100 chars) - officer category
+//   - note: string (optional, <= 1000 chars) - additional note
+//   - active: bool (required) - whether officer account is enabled
+//   - createdAt: timestamp or ISO string (optional, <= 64 chars)
+//   - updatedAt: timestamp or ISO string (optional, <= 64 chars)
+//
+// Collection: officer_auth/{hash}
+// Document ID: 64-char lowercase hex SHA-256 of "<phone>:<password>" (^[a-f0-9]{64}$)
+// Fields (ZERO PII):
+//   - active: bool (required) - indicates whether hash belongs to an active officer
+//
+// Collection: patients/{patientId}
+// Document ID: auto-generated or seed_<nnnn>
+// Fields:
+//   - seqNo: int (optional, 0..1000000) - registry sequence number
+//   - nationalId: string (optional, <= 30 chars) - formatted Thai National ID
+//   - nationalIdDigits: string (optional, <= 20 chars) - digits-only National ID
+//   - fullName: string (required, 1..200 chars) - patient full name
+//   - nickname: string (optional, <= 100 chars)
+//   - age: string (optional, <= 20 chars)
+//   - startYearBE: string (optional, <= 20 chars)
+//   - colorGroup: string (optional, enum: '', 'แดง', 'ส้ม', 'เหลือง', 'เขียว', 'ทดสอบ')
+//   - addressNo: string (optional, <= 100 chars)
+//   - moo: string (optional, <= 50 chars)
+//   - subdistrict: string (optional, <= 100 chars)
+//   - district: string (optional, <= 100 chars)
+//   - province: string (optional, <= 100 chars)
+//   - note: string (optional, <= 5000 chars)
+//   - diagnosis: string (optional, <= 200 chars)
+//   - diagnosisCode: string (optional, <= 50 chars)
+//   - legacyPhotoRef: string (optional, <= 300 chars)
+//   - photos: list (optional, <= 6 validated photo maps)
+//   - gps: map or null (optional, { lat, lng, accuracy?, capturedAt? })
+//   - createdBy: map (required, immutable for non-admin, { username, fullName, role, callsign?, position? })
+//   - createdAt: timestamp or ISO string (required, immutable for non-admin, <= 64 chars)
+//   - updatedBy: map (required, anti-spoofed, { username, fullName, role, callsign?, position? })
+//   - updatedAt: timestamp or ISO string (required, <= 64 chars)
+//
+// Collection: audit_logs/{logId}
+// Document ID: auto-generated (strictly append-only, immutable)
+// Fields:
+//   - action: string (required, enum: CREATE, UPDATE, DELETE, SEED_IMPORT, OFFICER_UPDATE)
+//   - targetType: string (required, enum: patient, officer)
+//   - targetId: string (required, 1..128 chars)
+//   - targetName: string (required, <= 300 chars)
+//   - targetNationalId: string (required, <= 50 chars)
+//   - actor: map (required, anti-spoofed against Firebase Auth identity)
+//   - summary: string (required, <= 5000 chars)
+//   - changes: map (required, <= 30 entries, allowed diff keys only)
+//   - timestamp: timestamp or ISO string (required, <= 64 chars)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Authentication & Role Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data)
+        || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data)
+        || request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasAuthEmail() {
+      return isAuthenticated()
+        && 'email' in request.auth.token
+        && request.auth.token.email is string;
+    }
+
+    function isAdmin() {
+      return hasAuthEmail()
+        && request.auth.token.email.lower() == 'bangplama001@bangplama.local';
+    }
+
+    function isOfficerEmail() {
+      return hasAuthEmail()
+        && request.auth.token.email.lower().matches('^p_[0-9]{9,10}@bangplama\\.local$');
+    }
+
+    function officerPhone() {
+      return request.auth.token.email.lower().split('@')[0].split('_')[1];
+    }
+
+    function isActiveOfficer() {
+      return isOfficerEmail()
+        && exists(/databases/$(database)/documents/officers/$(officerPhone()))
+        && get(/databases/$(database)/documents/officers/$(officerPhone())).data.active == true;
+    }
+
+    function isStationStaff() {
+      return isAdmin() || isActiveOfficer();
+    }
+
+    // ===============================================================
+    // Generic Validation Helper Functions
+    // ===============================================================
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidOptionalString(data, field, minLen, maxLen) {
+      return !(field in data)
+        || (data[field] is string
+            && data[field].size() >= minLen
+            && data[field].size() <= maxLen);
+    }
+
+    function isValidTimestampOrIso(val) {
+      return (val is timestamp)
+        || (val is string && val.size() > 0 && val.size() <= 64);
+    }
+
+    function isValidOptionalTimestampOrIso(data, field) {
+      return !(field in data) || isValidTimestampOrIso(data[field]);
+    }
+
+    function isValidHttpUrl(url) {
+      return url is string
+        && url.size() <= 2048
+        && ((url.size() >= 8 && url[0:8] == 'https://')
+            || (url.size() >= 7 && url[0:7] == 'http://'));
+    }
+
+    function isValidImageDataUrl(val) {
+      return val is string
+        && val.size() > 11
+        && val.size() <= 650000
+        && val[0:11] == 'data:image/';
+    }
+
+    // ===============================================================
+    // Domain Validators (Used in BOTH create and update rules)
+    // ===============================================================
+
+    function isValidActor(actor) {
+      return actor is map
+        && actor.keys().hasOnly(['username', 'fullName', 'callsign', 'position', 'role'])
+        && actor.keys().hasAll(['username', 'fullName', 'role'])
+        && actor.username is string
+        && actor.username.size() > 0
+        && actor.username.size() <= 64
+        && actor.fullName is string
+        && actor.fullName.size() > 0
+        && actor.fullName.size() <= 200
+        && actor.role in ['admin', 'officer', 'system']
+        && isValidOptionalString(actor, 'callsign', 0, 100)
+        && isValidOptionalString(actor, 'position', 0, 200);
+    }
+
+    function isValidPhotoItem(item) {
+      return item is map
+        && item.keys().hasOnly(['name', 'dataUrl', 'url', 'sizeBytes', 'uploadedAt'])
+        && (('dataUrl' in item) || ('url' in item))
+        && isValidOptionalString(item, 'name', 0, 260)
+        && (!('dataUrl' in item) || isValidImageDataUrl(item.dataUrl))
+        && (!('url' in item) || isValidHttpUrl(item.url))
+        && (!('sizeBytes' in item)
+            || (item.sizeBytes is int && item.sizeBytes >= 0 && item.sizeBytes <= 1000000))
+        && isValidOptionalTimestampOrIso(item, 'uploadedAt');
+    }
+
+    function isValidPhotoList(photos) {
+      return photos is list
+        && photos.size() <= 6
+        && (photos.size() < 1 || isValidPhotoItem(photos[0]))
+        && (photos.size() < 2 || isValidPhotoItem(photos[1]))
+        && (photos.size() < 3 || isValidPhotoItem(photos[2]))
+        && (photos.size() < 4 || isValidPhotoItem(photos[3]))
+        && (photos.size() < 5 || isValidPhotoItem(photos[4]))
+        && (photos.size() < 6 || isValidPhotoItem(photos[5]));
+    }
+
+    function isValidGps(gps) {
+      return gps == null
+        || (gps is map
+            && gps.keys().hasOnly(['lat', 'lng', 'accuracy', 'capturedAt'])
+            && gps.keys().hasAll(['lat', 'lng'])
+            && gps.lat is number && gps.lat >= -90 && gps.lat <= 90
+            && gps.lng is number && gps.lng >= -180 && gps.lng <= 180
+            && (!('accuracy' in gps)
+                || (gps.accuracy is number && gps.accuracy >= 0 && gps.accuracy <= 1000000))
+            && isValidOptionalTimestampOrIso(gps, 'capturedAt'));
+    }
+
+    function isValidOfficer(data, phone) {
+      return phone.matches('^[0-9]{9,10}$')
+        && hasOnlyAllowedFields([
+             'seq', 'phone', 'phoneDisplay', 'fullName', 'position',
+             'callsign', 'category', 'note', 'active', 'updatedAt', 'createdAt'
+           ])
+        && hasRequiredFields(['phone', 'fullName', 'active'])
+        && data.phone is string
+        && data.phone == phone
+        && data.fullName is string
+        && data.fullName.size() > 0
+        && data.fullName.size() <= 200
+        && data.active is bool
+        && (!('seq' in data) || (data.seq is int && data.seq >= 0 && data.seq <= 100000))
+        && isValidOptionalString(data, 'phoneDisplay', 0, 30)
+        && isValidOptionalString(data, 'position', 0, 200)
+        && isValidOptionalString(data, 'callsign', 0, 100)
+        && isValidOptionalString(data, 'category', 0, 100)
+        && isValidOptionalString(data, 'note', 0, 1000)
+        && isValidOptionalTimestampOrIso(data, 'updatedAt')
+        && isValidOptionalTimestampOrIso(data, 'createdAt');
+    }
+
+    function isValidOfficerAuth(data) {
+      return hasOnlyAllowedFields(['active'])
+        && hasRequiredFields(['active'])
+        && data.active is bool;
+    }
+
+    function isValidPatient(data) {
+      return hasOnlyAllowedFields([
+             'seqNo', 'nationalId', 'nationalIdDigits', 'fullName', 'nickname',
+             'age', 'startYearBE', 'colorGroup', 'addressNo', 'moo',
+             'subdistrict', 'district', 'province', 'note', 'diagnosis',
+             'diagnosisCode', 'legacyPhotoRef', 'photos', 'gps',
+             'createdBy', 'createdAt', 'updatedBy', 'updatedAt'
+           ])
+        && hasRequiredFields(['fullName', 'createdBy', 'createdAt', 'updatedBy', 'updatedAt'])
+        && data.fullName is string
+        && data.fullName.size() > 0
+        && data.fullName.size() <= 200
+        && (!('seqNo' in data) || (data.seqNo is int && data.seqNo >= 0 && data.seqNo <= 1000000))
+        && isValidOptionalString(data, 'nationalId', 0, 30)
+        && isValidOptionalString(data, 'nationalIdDigits', 0, 20)
+        && isValidOptionalString(data, 'nickname', 0, 100)
+        && isValidOptionalString(data, 'age', 0, 20)
+        && isValidOptionalString(data, 'startYearBE', 0, 20)
+        && (!('colorGroup' in data)
+            || (data.colorGroup is string
+                && data.colorGroup in ['', 'แดง', 'ส้ม', 'เหลือง', 'เขียว', 'ทดสอบ']))
+        && isValidOptionalString(data, 'addressNo', 0, 100)
+        && isValidOptionalString(data, 'moo', 0, 50)
+        && isValidOptionalString(data, 'subdistrict', 0, 100)
+        && isValidOptionalString(data, 'district', 0, 100)
+        && isValidOptionalString(data, 'province', 0, 100)
+        && isValidOptionalString(data, 'note', 0, 5000)
+        && isValidOptionalString(data, 'diagnosis', 0, 200)
+        && isValidOptionalString(data, 'diagnosisCode', 0, 50)
+        && isValidOptionalString(data, 'legacyPhotoRef', 0, 300)
+        && (!('photos' in data) || isValidPhotoList(data.photos))
+        && (!('gps' in data) || isValidGps(data.gps))
+        && isValidActor(data.createdBy)
+        && isValidActor(data.updatedBy)
+        && isValidTimestampOrIso(data.createdAt)
+        && isValidTimestampOrIso(data.updatedAt);
+    }
+
+    function isValidPatientCreateActor(data) {
+      return (isAdmin()
+          && ((data.createdBy.role == 'admin' && data.createdBy.username == 'bangplama001')
+              || (data.createdBy.role == 'system' && data.createdBy.username == 'system'))
+          && ((data.updatedBy.role == 'admin' && data.updatedBy.username == 'bangplama001')
+              || (data.updatedBy.role == 'system' && data.updatedBy.username == 'system')))
+        || (!isAdmin()
+          && data.createdBy.username == officerPhone()
+          && data.createdBy.role == 'officer'
+          && data.updatedBy.username == officerPhone()
+          && data.updatedBy.role == 'officer');
+    }
+
+    function isValidPatientUpdateActor(data, existing) {
+      return (isAdmin()
+          && ((data.createdBy == existing.createdBy && data.createdAt == existing.createdAt)
+              || (data.createdBy.role == 'system' && data.createdBy.username == 'system'))
+          && ((data.updatedBy.role == 'admin' && data.updatedBy.username == 'bangplama001')
+              || (data.updatedBy.role == 'system' && data.updatedBy.username == 'system')))
+        || (!isAdmin()
+          && data.createdBy == existing.createdBy
+          && data.createdAt == existing.createdAt
+          && data.updatedBy.username == officerPhone()
+          && data.updatedBy.role == 'officer');
+    }
+
+    function isValidAuditLog(data) {
+      return hasOnlyAllowedFields([
+             'action', 'targetType', 'targetId', 'targetName',
+             'targetNationalId', 'actor', 'summary', 'changes', 'timestamp'
+           ])
+        && hasRequiredFields([
+             'action', 'targetType', 'targetId', 'targetName',
+             'targetNationalId', 'actor', 'summary', 'changes', 'timestamp'
+           ])
+        && data.action in ['CREATE', 'UPDATE', 'DELETE', 'SEED_IMPORT', 'OFFICER_UPDATE']
+        && data.targetType in ['patient', 'officer']
+        && data.targetId is string && data.targetId.size() > 0 && data.targetId.size() <= 128
+        && data.targetName is string && data.targetName.size() <= 300
+        && data.targetNationalId is string && data.targetNationalId.size() <= 50
+        && isValidActor(data.actor)
+        && data.summary is string && data.summary.size() <= 5000
+        && data.changes is map
+        && data.changes.size() <= 30
+        && data.changes.keys().hasOnly([
+             'nationalId', 'fullName', 'nickname', 'age', 'startYearBE',
+             'colorGroup', 'addressNo', 'moo', 'subdistrict', 'district',
+             'province', 'note', 'diagnosis', 'diagnosisCode',
+             'photosCount', 'gps'
+           ])
+        && isValidTimestampOrIso(data.timestamp);
+    }
+
+    function isValidAuditLogActor(data) {
+      return (isAdmin()
+          && data.actor.username == 'bangplama001'
+          && data.actor.role == 'admin'
+          && data.action in ['CREATE', 'UPDATE', 'DELETE', 'SEED_IMPORT', 'OFFICER_UPDATE'])
+        || (!isAdmin()
+          && data.actor.username == officerPhone()
+          && data.actor.role == 'officer'
+          && data.action in ['CREATE', 'UPDATE', 'DELETE']
+          && data.targetType == 'patient');
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // Police officers roster (contains PII: officer phone & full name)
+    match /officers/{phone} {
+      allow get: if isAdmin() || (isOfficerEmail() && phone == officerPhone());
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidOfficer(request.resource.data, phone);
+      allow update: if isAdmin() && isValidOfficer(request.resource.data, phone);
+      allow delete: if isAdmin();
+    }
+
+    // Hash-only pre-login registry (ZERO PII: { active: bool } only; list disabled)
+    match /officer_auth/{hash} {
+      allow get: if hash.matches('^[a-f0-9]{64}$');
+      allow list: if false;
+      allow create: if isAdmin()
+        && hash.matches('^[a-f0-9]{64}$')
+        && isValidOfficerAuth(request.resource.data);
+      allow update: if isAdmin()
+        && hash.matches('^[a-f0-9]{64}$')
+        && isValidOfficerAuth(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // Mental health patient registry (sensitive citizen & medical PII)
+    match /patients/{patientId} {
+      allow get, list: if isStationStaff();
+      allow create: if isStationStaff()
+        && isValidPatient(request.resource.data)
+        && isValidPatientCreateActor(request.resource.data);
+      allow update: if isStationStaff()
+        && isValidPatient(request.resource.data)
+        && isValidPatientUpdateActor(request.resource.data, resource.data);
+      allow delete: if isStationStaff();
+    }
+
+    // Immutable append-only audit trail (Admin read-only; staff append-only)
+    match /audit_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isStationStaff()
+        && isValidAuditLog(request.resource.data)
+        && isValidAuditLogActor(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // Explicit catch-all default deny for any unmatched path
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
