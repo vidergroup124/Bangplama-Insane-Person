@@ -134,6 +134,9 @@ function startSubscriptions() {
   state.unsubscribers.push(unsubPatients);
 
   if (state.user.role === 'admin') {
+    dataService.ensureFirebaseSeededIfEmpty().catch((err) => {
+      showToast(`นำเข้าข้อมูลตั้งต้นไม่สำเร็จ: ${err?.message || err}`, 'error');
+    });
     const unsubLogs = dataService.subscribeAuditLogs((list) => {
       state.logs = list;
       if (state.activeTab === 'admin') renderApp();
